@@ -6,7 +6,7 @@
 #   Figure3a1: SCENIC Binary Heatmap
 #   Figure3a2: DoRothEA Top TF Heatmap
 #   Figure3b: EGR1 FeaturePlot
-# Journal Format: Cell Press
+
 ###############################################################
 
 ###########################
