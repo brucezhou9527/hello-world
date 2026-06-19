@@ -1,0 +1,109 @@
+# ======================================================================
+# MODULE 0: Global Environment Reset & Parallelization Setup
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(future)
+library(future.apply)
+library(AUCell)
+library(clusterProfiler)
+library(doMC)
+library(doParallel)
+library(doRNG)
+
+# Configure parallel computation architecture (Optimized for Unix-like clusters)
+plan("multicore", workers = 20) 
+options(future.globals.maxSize = 20 * 1024^3) 
+
+
+# ======================================================================
+# MODULE 1: Dataset Importation & Exploratory Assessment
+# ======================================================================
+# Load the pre-processed and subsetted CD4+ T cell object
+seu <- readRDS(input_cd4_rds_path)
+
+
+# ======================================================================
+# MODULE 2: Transcriptomic Ranking Construction (AUCell Engine)
+# ======================================================================
+# Build critical cell rankings based on the normalized expression data matrix
+# Process executed in parallel to accelerate scoring timelines across massive cell pools
+cells_rankings <- AUCell_buildRankings(
+  exprMat        = GetAssayData(seu, assay = "RNA", slot = "data"), 
+  nCores         = 12, 
+  plotStats      = FALSE, 
+  splitByBlocks  = TRUE
+)
+
+
+# ======================================================================
+# MODULE 3: Gene Set Curation & Pathway Activation Scoring (AUC)
+# ======================================================================
+# Import standard MSigDB and Reactome functional annotation databases
+go_gmt       <- read.gmt(go_gmt_path) 
+reactome_gmt <- read.gmt(reactome_gmt_path) 
+
+# Combine pathways into a cohesive functional target signature dataframe
+combined_gmt <- rbind(go_gmt, reactome_gmt)
+
+# Convert metadata records into structured molecular gene sets
+pathway_names <- unique(combined_gmt$term)
+gene_sets <- lapply(pathway_names, function(term_id) {
+  combined_gmt$gene[combined_gmt$term == term_id]
+})
+names(gene_sets) <- pathway_names
+
+# Calculate single-cell area under the curve (AUC) metrics across target trajectories
+# Enrichment cutoff threshold tightly parameterized at the top 10% of total transcripts
+cells_auc_matrix <- AUCell_calcAUC(
+  geneSets      = gene_sets, 
+  rankings      = cells_rankings, 
+  nCores        = 24, 
+  aucMaxRank    = nrow(cells_rankings) * 0.1
+)
+
+# Seamlessly extract and append definitive pathway metrics to object metadata slots
+seu$AUC_GO_OGT       <- as.numeric(getAUC(cells_auc_matrix)["GOBP_PROTEIN_O_LINKED_GLYCOSYLATION", ])
+seu$AUC_REACTOME_OGT <- as.numeric(getAUC(cells_auc_matrix)["REACTOME_O_LINKED_GLYCOSYLATION", ])
+
+
+# ======================================================================
+# MODULE 4: Clinical Cohort Stratification & Visual Characterization
+# ======================================================================
+# Isolate clinical intervention cohorts based on specific tissue or response attributes
+# Target cohorts: Responders (ESCC_R) versus Non-Responders (ESCC_NR)
+seu_stratified <- subset(seu, subset = tumor_type %in% c('ESCC_R', 'ESCC_NR'))
+
+# Generate standard publication-ready spatial feature embedding layouts
+p_features <- FeaturePlot(
+  object   = seu_stratified, 
+  features = c('AUC_GO_OGT', 'AUC_REACTOME_OGT', 'OGT', 'CD4', 'FOXP3'),
+  ncol     = 3
+) & theme_bw() & theme(panel.grid = element_blank())
+
+# Generate non-parametric abundance/density distribution profiles across clinical segments
+p_violin <- VlnPlot(
+  object   = seu_stratified, 
+  features = c('AUC_GO_OGT', 'AUC_REACTOME_OGT', 'OGT'),
+  group.by = 'celltype_main', 
+  split.by = 'tumor_type', 
+  pt.size  = 0,
+  ncol     = 3
+) & theme_bw() & theme(panel.grid = element_blank())
+
+
+# ======================================================================
+# MODULE 5: Persistence & Environmental Cleanup
+# ======================================================================
+# Persist fully scored and parameterized Seurat object to secondary storage
+saveRDS(seu, file = output_scored_rds_path)
+
+# Clear high-capacity temporary matrix arrays to free compute environment
+rm(cells_rankings, combined_gmt, go_gmt, reactome_gmt, cells_auc_matrix)
+gc()
