@@ -1,0 +1,123 @@
+# ======================================================================
+# MODULE 0: Global Environment Reset & Library Loading
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(dplyr)
+library(harmony)
+library(Rcpp)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(readr)
+library(cowplot)
+library(reticulate)
+library(SeuratData)
+library(SeuratDisk)
+
+
+# ======================================================================
+# MODULE 1: Dataset Merging & Doublet Filtering
+# ======================================================================
+# Load unintegrated individual sample RDS objects from list
+seurat_list <- lapply(sample_files, readRDS)
+
+# Merge all datasets into a single unintegrated Seurat object
+sce <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1]
+)
+
+# Intercept and eliminate predicted heterotypic doublets
+sce <- subset(sce, subset = doublets == 'Singlet')
+
+
+# ======================================================================
+# MODULE 2: Cell Cycle Scoring & Blacklist Gene Exclusion
+# ======================================================================
+# Exclude problematic features from standard cell cycle marker sets
+s_genes   <- cc.genes$s.genes[-15]
+g2m_genes <- cc.genes$g2m.genes[-c(16, 30)]
+
+# Compute cell cycle phase scores to mitigate proliferative confounding
+sce <- CellCycleScoring(sce, s.features = s_genes, g2m.features = g2m_genes, set.ident = TRUE)
+
+# Standard log-normalization and initial feature selection
+sce <- NormalizeData(sce, verbose = TRUE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000)
+
+# Identify non-informative and technical variable features for exclusion
+hsp_genes  <- grep(pattern = "^HSP",  rownames(sce), value = TRUE)
+mt_genes   <- grep(pattern = "^MT-",  rownames(sce), value = TRUE)
+rpl_genes  <- grep(pattern = "^RPL",  rownames(sce), value = TRUE)
+rps_genes  <- grep(pattern = "^RPS",  rownames(sce), value = TRUE)
+malat1     <- grep(pattern = "^MALAT1$", rownames(sce), value = TRUE)
+
+gene_blacklist <- c(hsp_genes, mt_genes, rpl_genes, rps_genes, malat1)
+
+# Overwrite VariableFeatures to bypass the technical blacklist downstream
+VariableFeatures(sce) <- setdiff(VariableFeatures(sce), gene_blacklist)
+
+
+# ======================================================================
+# MODULE 3: Linear Reduction & Batch Effect Correction (Harmony)
+# ======================================================================
+# Regress out mitochondrial contamination and cell cycle phase variations
+sce <- ScaleData(sce, vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE) %>%
+  RunPCA(npcs = 50, verbose = TRUE)
+
+# Execute batch effect correction across individual patient components
+sce <- RunHarmony(sce, group.by.vars = "orig.ident")
+
+
+# ======================================================================
+# MODULE 4: Non-Linear Dimensional Reduction & Graph-Based Clustering
+# ======================================================================
+# Construct topological manifolds and clusters based on the Harmony embedding space
+sce <- sce %>% 
+  RunUMAP(reduction = "harmony", dims = 1:50) %>% 
+  RunTSNE(reduction = "harmony", dims = 1:50) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:50) %>%
+  FindClusters(resolution = 1.0)
+
+
+# ======================================================================
+# MODULE 5: Cross-Language Interoperability (H5AD Export)
+# ======================================================================
+# Save temporary intermediate files to bridge R and Python environments
+SaveH5Seurat(sce, filename = temp_h5seurat, overwrite = TRUE)
+Convert(temp_h5seurat, dest = "h5ad", overwrite = TRUE)
+
+
+# ======================================================================
+# MODULE 6: Automated Reference-Based Annotation (CellTypist)
+# ======================================================================
+# Initialize Python runtime environment via reticulate
+scanpy    <- import("scanpy")
+celltypist <- import("celltypist")
+
+# Load integrated matrix and execute predictions using the comprehensive immune reference model
+adata <- scanpy$read_h5ad(temp_h5ad)
+predictions <- celltypist$annotate(adata, model = 'Immune_All_High.pkl', majority_voting = TRUE)
+
+# Extract prediction labels and transfer metadata back into Seurat
+celltype_prediction <- predictions$predicted_labels[, c("predicted_labels", "majority_voting")]
+colnames(celltype_prediction) <- c("predicted_labels_High", "majority_voting_High")
+
+sce <- AddMetaData(sce, metadata = celltype_prediction)
+
+
+# ======================================================================
+# MODULE 7: Meta-Data Stratification & Final Persistence
+# ======================================================================
+# Define clinical intervention parameters based on tumor tissue origin
+sce$treatment <- ifelse(sce$tumor_type %in% c('ESCC', 'Adjacent'), 'none', 'ncit')
+
+# Save integrated and fully annotated object
+saveRDS(sce, file = output_integrated_rds)
+
+# Clean up memory caches
+rm(seurat_list, adata, predictions, celltype_prediction)
+gc()
