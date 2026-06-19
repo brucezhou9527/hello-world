@@ -1,0 +1,128 @@
+# ======================================================================
+# MODULE 0: Global Environment Reset & Parallelization Setup
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(dplyr)
+library(future)
+library(future.apply)
+library(DoubletFinder)
+library(ggplot2)
+
+# Configure multisession parallel processing for Windows/Linux/macOS compatibility
+plan("multisession", workers = 20) 
+
+# Set memory allocation limit for future globals to 20 GB
+options(future.globals.maxSize = 20 * 1024^3) 
+
+
+# ======================================================================
+# MODULE 1: 10X Data Loading & Quality Control (QC)
+# ======================================================================
+# Load raw 10X Genomics counts matrix from input directory
+raw_counts <- Read10X(data.dir = input_data_dir)
+
+# Initialize Seurat object
+sce <- CreateSeuratObject(
+  counts       = raw_counts, 
+  project      = sample_id, 
+  min.cells    = 0, 
+  min.features = 200
+)
+
+# Calculate mitochondrial gene expression percentage
+sce[["percent.mt"]] <- PercentageFeatureSet(sce, pattern = "^MT-")
+
+# Apply rigorous QC thresholds for viable single cells
+sce_qc <- subset(
+  sce, 
+  subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 30
+)
+
+# Prepend sample ID to cell barcodes to prevent duplication during downstream integration
+sce_qc <- RenameCells(sce_qc, add.cell.id = sample_id)
+
+# Append clinical metadata attribute
+sce_qc$tumor_type <- "Adjacent"
+
+
+# ======================================================================
+# MODULE 2: Downstream Dimensional Reduction & Clustering
+# ======================================================================
+# Standard log-normalization and highly variable feature selection
+sce_qc <- NormalizeData(sce_qc, normalization.method = "LogNormalize", scale.factor = 10000)
+sce_qc <- FindVariableFeatures(sce_qc, selection.method = "vst", nfeatures = 2000)
+
+# Regress out technical variation caused by mitochondrial contamination
+sce_qc <- ScaleData(sce_qc, vars.to.regress = "percent.mt")
+
+# Perform linear dimensional reduction via PCA
+sce_qc <- RunPCA(sce_qc, features = VariableFeatures(object = sce_qc), verbose = FALSE)
+
+# Graph-based clustering and non-linear dimensional reduction via UMAP
+sce_qc <- FindNeighbors(sce_qc, dims = 1:30)
+sce_qc <- RunUMAP(sce_qc, dims = 1:30, verbose = FALSE)
+sce_qc <- FindClusters(sce_qc, resolution = 1.0)
+
+
+# ======================================================================
+# MODULE 3: Heterotypic Doublet Identification (DoubletFinder Pipeline)
+# ======================================================================
+sce_db <- sce_qc
+
+# Run parameter sweep to identify the optimal pK value (sct = FALSE matches LogNormalize)
+sweep_res   <- paramSweep_v3(sce_db, PCs = 1:30, sct = FALSE)
+sweep_stats <- summarizeSweep(sweep_res, GT = FALSE)  
+bcmvn       <- find.pK(sweep_stats)
+
+# Dynamically extract the pK value exhibiting the maximum BCmetric
+best_pK <- bcmvn$pK[which.max(bcmvn$BCmetric)] %>% as.character() %>% as.numeric()
+
+# Estimate the expected doublet rate based on droplet cell throughput
+doublet_rate <- ncol(sce_db) * 8 * 1e-6 
+
+# Model homotypic doublet proportion and adjust expected doublet count
+homotypic_prop <- modelHomotypic(sce_db$seurat_clusters)    
+nExp_poi       <- round(doublet_rate * ncol(sce_db)) 
+nExp_poi_adj   <- round(nExp_poi * (1 - homotypic_prop))
+
+# Execute core DoubletFinder prediction
+sce_db <- doubletFinder_v3(
+  sce_db, PCs = 1:30, pN = 0.25, pK = best_pK, 
+  nExp = nExp_poi_adj, reuse.pANN = FALSE, sct = FALSE
+)
+
+
+# ======================================================================
+# MODULE 4: Metadata Synchronization & Visual Validation
+# ======================================================================
+# Use regular expression to dynamically fetch the parameter-dependent DoubletFinder column
+classification_col <- grep("^DF.classifications", colnames(sce_db@meta.data), value = TRUE)
+
+# Synchronize doublet classification back to the primary QC-filtered object
+sce_qc$doublets <- sce_db@meta.data[[classification_col]]
+
+# Generate publication-grade UMAP displaying heterotypic doublet distribution
+p_doublet <- DimPlot(sce_qc, group.by = 'doublets', cols = c("#E93E3F", "#A6CEE3FF")) + 
+  theme_bw() + 
+  theme(
+    panel.grid   = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1.2),
+    plot.title   = element_text(face = "bold", hjust = 0.5)
+  ) + 
+  ggtitle(paste0("Sample ", sample_id, " : Doublets Distribution"))
+
+print(p_doublet)
+
+
+# ======================================================================
+# MODULE 5: Persistence & Memory Deallocation
+# ======================================================================
+# Save processed Seurat object containing definitive QC and doublet metadata
+saveRDS(sce_qc, file = output_rds_path)
+
+# Flush environment memory cached during parameter sweeping
+rm(raw_counts, sce, sce_db, sweep_res, sweep_stats, bcmvn)
+gc()
