@@ -1,0 +1,183 @@
+# ======================================================================
+# MODULE 0: Global Environment Setup & Parallelization
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GseaVis)
+library(ggplot2)
+library(GSEABase)
+library(enrichplot)
+library(GSVA)
+library(IOBR)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggpubr)
+
+# Configure parallel compute configurations
+plan("multicore", workers = 20)
+options(future.globals.maxSize = 20 * 1024^3)
+
+
+# ======================================================================
+# MODULE 1: Expression Normalization & Conversion (FPKM to TPM)
+# ======================================================================
+# Load expression counts matrix
+fpkm_matrix <- read_table(input_fpkm_path)
+
+# Retain rows with complete cases
+fpkm_matrix <- fpkm_matrix[complete.cases(fpkm_matrix), ]
+
+# Format dataframe structure and set gene symbols as row identifiers
+fpkm_df           <- data.frame(fpkm_matrix)
+rownames(fpkm_df) <- fpkm_df[[1]]
+fpkm_df           <- fpkm_df[, -1]
+
+# Define expression mathematical transformation function
+fpkm_to_tpm <- function(fpkm) {
+  exp(log(fpkm) - log(sum(fpkm)) + log(1e6))
+}
+
+# Apply column-wise transformation to yield TPM matrix
+tpm_matrix <- apply(fpkm_df, 2, fpkm_to_tpm)
+expr_mat   <- as.matrix(tpm_matrix)
+
+
+# ======================================================================
+# MODULE 2: Gene Set Curation & Pathway Activation Scoring (ssGSEA)
+# ======================================================================
+# Load functional annotation pathway signatures
+gmt_1 <- read.gmt(pathway_gmt_path_1) 
+gmt_2 <- read.gmt(pathway_gmt_path_2) 
+combined_gmt <- rbind(gmt_1, gmt_2)
+
+# Structure inputs into list formats expected by the GSVA engine
+unique_terms <- unique(combined_gmt$term)
+geneset_list <- lapply(unique_terms, function(term_id) {
+  combined_gmt$gene[combined_gmt$term == term_id]
+})
+names(geneset_list) <- unique_terms
+
+# Execute single-sample GSEA estimation across continuous data distributions
+gsva_results <- gsva(
+  expr          = expr_mat, 
+  gset.idx.list = geneset_list, 
+  mx.diff       = TRUE, 
+  kcdf          = "Gaussian", 
+  parallel.sz   = 24, 
+  method        = 'ssgsea',
+  abs.ranking   = FALSE
+)
+
+# Reshape scores to build clinical-ready sample rows
+pathway_scores <- t(as.data.frame(gsva_results))
+
+
+# ======================================================================
+# MODULE 3: TME Deconvolution & Metadata Fusion
+# ======================================================================
+# Load clinical metadata annotations
+clinical_annotation <- read_csv(input_clinical_path)
+clinical_df         <- data.frame(clinical_annotation)
+rownames(clinical_df) <- clinical_df[[sample_id_column]]
+
+# Synchronize sample overlap between scoring matrices and metadata
+intersected_samples <- intersect(rownames(pathway_scores), rownames(clinical_df))
+pathway_scores      <- pathway_scores[intersected_samples, ]
+clinical_subset     <- clinical_df[intersected_samples, ]
+
+# Consolidate clinical profiles with pathway scores
+merged_metadata <- cbind(clinical_subset, pathway_scores)
+
+# Synchronize expression matrix tracking targets
+expr_mat <- expr_mat[, intersected_samples]
+
+# Execute cell-type deconvolution via CIBERSORT algorithm
+tme_deconvoluted <- deconvo_tme(eset = expr_mat, method = 'cibersort', arrays = TRUE, perm = 100)
+rownames(tme_deconvoluted) <- tme_deconvoluted$ID
+
+# Isolate independent target gene features from expression space
+target_gene_vector <- expr_mat[target_gene_symbol, ]
+
+# Combine consolidated datasets into a unified microenvironment master dataframe
+master_tme_df <- cbind(merged_metadata, tme_deconvoluted, target_gene_feature = target_gene_vector)
+
+
+# ======================================================================
+# MODULE 4: Stratification & Tidy TME Data Reshaping
+# ======================================================================
+# Stratify cohorts based on median pathway score cuts
+score_threshold <- quantile(master_tme_df[[target_pathway_name]], probs = 0.5, na.rm = TRUE)
+master_tme_df$Group <- ifelse(master_tme_df[[target_pathway_name]] > score_threshold, "High", "Low")
+
+# Isolate cibersort column variables dynamically to protect pipeline from index shifts
+cibersort_cols <- grep("_CIBERSORT$", colnames(master_tme_df), value = TRUE)
+
+# Reshape data into long formats utilizing modern tidyr architecture
+tme_long <- master_tme_df %>%
+  select(Group, sample_id_column, all_of(cibersort_cols)) %>%
+  pivot_longer(
+    cols      = all_of(cibersort_cols),
+    names_to  = "Celltype",
+    values_to = "Composition"
+  ) %>%
+  mutate(
+    Celltype = sub("_CIBERSORT$", "", Celltype),
+    Log_Composition = log10(1 + Composition * 100)
+  )
+
+# Compute median cell-type abundance ranks in High cohort to structure X-axis sorting
+plot_order <- tme_long %>%
+  filter(Group == "High") %>%
+  group_by(Celltype) %>%
+  summarise(med_val = median(Composition, na.rm = TRUE)) %>%
+  arrange(desc(med_val)) %>%
+  pull(Celltype)
+
+tme_long$Celltype <- factor(tme_long$Celltype, levels = plot_order)
+
+
+# ======================================================================
+# MODULE 5: Publication-Grade Visual Characterization & Export
+# ======================================================================
+# Academic presentation theme configurations
+academic_theme <- theme_classic() +
+  theme(
+    plot.title       = element_text(size = 12, color = "black", hjust = 0.5, face = "bold"),
+    axis.title       = element_text(size = 12, color = "black"), 
+    axis.text        = element_text(size = 8,  color = "black"),
+    axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    panel.grid       = element_blank(),
+    legend.position  = "top",
+    legend.text      = element_text(size = 12),
+    legend.title     = element_text(size = 12, face = "bold")
+  )
+
+# Generate non-parametric comparison profile (Log-transformed scale)
+p_tme_log <- ggplot(tme_long, aes(x = Celltype, y = Log_Composition)) +
+  labs(y = "Log10(1 + Cell composition * 100)", x = NULL, title = "TME Cell Composition Profile") +   
+  geom_boxplot(aes(fill = Group), position = position_dodge(0.5), width = 0.5, outlier.alpha = 0) + 
+  scale_fill_manual(values = c("#E93E3F", "#A6CEE3FF")) +
+  academic_theme + 
+  stat_compare_means(
+    aes(group = Group),
+    label     = "p.signif",
+    method    = "wilcox.test",
+    hide.ns   = TRUE
+  )
+
+# Export publication-grade vector graphic PDF
+ggsave(
+  filename  = output_pdf_path, 
+  plot      = p_tme_log, 
+  width     = 11.25, 
+  height    = 6.0, 
+  dpi       = 300
+)
+
+# Clear high-capacity matrices
+rm(fpkm_matrix, fpkm_df, tpm_matrix, gsva_results, pathway_scores, tme_deconvoluted)
+gc()
