@@ -1,0 +1,209 @@
+# ======================================================================
+# MODULE 0: Global Setup & Dynamic Input Abstraction
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(dplyr)
+library(tidyverse)
+library(AUCell)
+library(clusterProfiler)
+library(GSVA)
+library(survival)
+library(survminer)
+library(cowplot)
+
+# Parallel architecture configuration
+plan("multicore", workers = 20) 
+options(future.globals.maxSize = 20 * 1024^3)
+
+
+# ======================================================================
+# MODULE 1: Single-Cell Signature Derivation (AUCell & Differential Expression)
+# ======================================================================
+# Load single-cell framework data
+sce <- readRDS(input_sc_rds_path)
+
+# Construct cellular rankings across transcriptional matrices
+cells_rankings <- AUCell_buildRankings(
+  exprMat        = GetAssayData(sce, assay = "RNA", slot = "data"), 
+  nCores         = 8, 
+  plotStats      = FALSE, 
+  splitByBlocks  = TRUE
+)
+
+# Load reference GMT pathway lists
+gmt_1 <- read.gmt(gmt_path_1) 
+gmt_2 <- read.gmt(gmt_path_2) 
+combined_gmt <- rbind(gmt_1, gmt_2)
+
+gene_sets <- lapply(unique(combined_gmt$term), function(term_id) {
+  combined_gmt$gene[combined_gmt$term == term_id]
+})
+names(gene_sets) <- unique(combined_gmt$term)
+
+# Calculate pathway enrichment indices
+cells_auc_res <- AUCell_calcAUC(
+  geneSets   = gene_sets, 
+  rankings   = cells_rankings, 
+  nCores     = 8, 
+  aucMaxRank = nrow(cells_rankings) * 0.1
+)
+
+# Append raw calculated signature scores back to meta slot
+sce$AUC_GO_Score <- as.numeric(getAUC(cells_auc_res)[target_go_term, ])
+
+# Sub-stratify cellular populations down to specific target lineages and clinical cohorts
+sce_sub <- subset(sce, subset = celltype_fine %in% target_celltypes & tumor_type %in% target_tumors)
+
+# Partition cells into tertiles based on continuous score boundaries
+tertile_breaks <- quantile(sce_sub$AUC_GO_Score, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+sce_sub$Score_Group <- cut(
+  sce_sub$AUC_GO_Score, breaks = tertile_breaks, 
+  labels = c("Low", "Medium", "High"), include.lowest = TRUE
+)
+
+# Identify extreme-contrast differentially expressed features
+Idents(sce_sub) <- "Score_Group"
+de_markers <- FindMarkers(sce_sub, ident.1 = 'High', ident.2 = 'Low', logfc.threshold = 0.2, min.pct = 0.1)
+
+# Compile the top 100 up-regulated markers into a target signature list
+top_up_genes    <- de_markers %>% top_n(n = 100, wt = avg_log2FC) %>% rownames()
+bulk_gsea_genes <- list(Custom_Signature = top_up_genes)
+
+
+# ======================================================================
+# MODULE 2: Bulk Transcriptomic Normalization & ssGSEA Scoring
+# ======================================================================
+# Import bulk raw cohort expression data
+bulk_expr_raw <- read.csv(input_bulk_csv_path, header = TRUE)
+bulk_expr_raw <- bulk_expr_raw[!duplicated(bulk_expr_raw$SYMBOL), ]
+bulk_expr_raw <- bulk_expr_raw[complete.cases(bulk_expr_raw), ]
+
+rownames(bulk_expr_raw) <- bulk_expr_raw$SYMBOL
+bulk_expr_matrix        <- as.matrix(bulk_expr_raw[, -c(1:3)])
+
+# Quantify sample-specific signature induction via single-sample GSEA
+ssgsea_scores <- gsva(
+  expr          = bulk_expr_matrix, 
+  gset.idx.list = bulk_gsea_genes, 
+  mx.diff       = TRUE, 
+  kcdf          = "Gaussian", 
+  parallel.sz   = 24, 
+  method        = 'ssgsea',
+  abs.ranking   = FALSE
+)
+bulk_score_df <- t(as.data.frame(ssgsea_scores))
+
+
+# ======================================================================
+# MODULE 3: Cohort Clinical Integration & Filtering
+# ======================================================================
+# Load clinical meta annotations
+clinical_meta <- read.csv(input_clinical_csv_path, header = TRUE, row.names = sample_id_col)
+
+# Intersect clinical and scoring dimensions
+intersected_samples <- intersect(rownames(bulk_score_df), rownames(clinical_meta))
+integrated_data     <- cbind(clinical_meta[intersected_samples, ], bulk_score_df[intersected_samples, , drop = FALSE])
+colnames(integrated_data)[ncol(integrated_data)] <- "Target_Score"
+
+# Target specific disease histology/cancer type matrix slices
+survival_cohort_df <- integrated_data %>% filter(CANCER_TYPE == target_cancer_type)
+
+
+# ======================================================================
+# MODULE 4: Optimal Cutpoint Estimation & Loop Survival Processing
+# ======================================================================
+# Package parameters to automatically handle both endpoints sequentially
+endpoints_config <- list(
+  OS  = list(time = "OS_MONTHS",  event = "OS_CNSR_REV",  ylab = "Overall survival probability"),
+  PFS = list(time = "PFS_MONTHS", event = "PFS_CNSR_REV", ylab = "Progression-free survival")
+)
+
+collected_panel_plots <- list()
+
+for (ep in names(endpoints_config)) {
+  cfg <- endpoints_config[[ep]]
+  
+  # 💡 Core Optimization Strategy: Find statistically optimal threshold values
+  cut_engine <- surv_cutpoint(
+    data      = survival_cohort_df, 
+    time      = cfg$time, 
+    event     = cfg$event, 
+    variables = "Target_Score"
+  )
+  
+  # Categorize clinical matrices into discrete High/Low cohorts using calculated boundaries
+  categorized_df <- surv_categorize(cut_engine)
+  colnames(categorized_df) <- c("TIME", "EVENT", "Stratification")
+  
+  # Fit non-parametric Kaplan-Meier survival curves
+  km_fit <- survfit(Surv(TIME, EVENT) ~ Stratification, data = categorized_df)
+  
+  # Render highly customized, publication-grade visualization templates
+  km_plot_obj <- ggsurvplot(
+    km_fit,
+    data              = categorized_df,
+    surv.scale        = "percent",
+    break.time.by     = 6,
+    size              = 1.5,
+    xlim              = c(0, 30),
+    risk.table        = TRUE,
+    tables.height     = 0.3, 
+    tables.y.text.col = FALSE,
+    linetype          = c(1, 1), 
+    legend.labs       = c("High", "Low"),
+    font.legend       = c(9, "bold", "black"),
+    palette           = c("#440154", "#2A788E"), # Viridis contrast palette
+    ylab              = cfg$ylab,
+    xlab              = "Months after ICB",
+    pval              = TRUE,
+    conf.int          = FALSE,
+    ggtheme           = theme_bw() + theme(
+      panel.grid   = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, size = 1.2),
+      plot.title   = element_text(face = "bold", size = 12, hjust = 0.5)
+    ),
+    title             = paste0(ep, " Kinetics (Optimal Cutoff)")
+  )
+  
+  # Split out the main survival curve canvas and the numeric risk summary blocks
+  main_curve <- km_plot_obj$plot
+  risk_table <- km_plot_obj$table
+  
+  # Stack curve and table vertically to keep each panel self-contained and perfectly aligned
+  collected_panel_plots[[ep]] <- plot_grid(
+    main_curve, risk_table, 
+    ncol        = 1, 
+    align       = "v", 
+    rel_heights = c(1, 0.35)
+  )
+}
+
+
+# ======================================================================
+# MODULE 5: Master Panel Merging & Vector Graphic Production
+# ======================================================================
+# Combine OS (Panel A) and PFS (Panel B) side by side horizontally
+master_grid_graphic <- plot_grid(
+  plotlist       = collected_panel_plots, 
+  ncol           = 2, 
+  labels         = c("A", "B"), 
+  label_size     = 16, 
+  label_fontface = "bold"
+)
+
+# Output infinite-resolution vector format PDF file
+ggsave(
+  filename  = output_merged_pdf_path, 
+  plot      = master_grid_graphic, 
+  width     = 13.5, 
+  height    = 7.0, 
+  dpi       = 300,
+  limitsize = FALSE
+)
+
+# Purge memory matrices
+rm(sce, sce_sub, bulk_expr_raw, bulk_expr_matrix, bulk_score_df, integrated_data, survival_cohort_df)
+gc()
