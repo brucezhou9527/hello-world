@@ -1,0 +1,125 @@
+# ======================================================================
+# MODULE 0: Global Environment Setup & Library Loading
+# ======================================================================
+rm(list = ls())
+gc()
+
+library(Seurat)
+library(monocle3)
+library(tidyverse)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+
+
+# ======================================================================
+# MODULE 1: Object Construction & Linear Preprocessing
+# ======================================================================
+# Extract components from the curated Seurat object
+raw_counts      <- GetAssayData(seu, assay = 'RNA', slot = 'counts')
+cell_metadata   <- seu@meta.data
+gene_annotation <- data.frame(
+  gene_short_name = rownames(raw_counts),
+  row.names       = rownames(raw_counts)
+)
+
+# Initialize the cell_data_set object
+cds <- new_cell_data_set(
+  expression_data = raw_counts,                          
+  cell_metadata   = cell_metadata,                          
+  gene_metadata   = gene_annotation
+)
+
+# Perform initial PCA preprocessing
+cds <- preprocess_cds(cds, num_dim = 50)
+
+
+# ======================================================================
+# MODULE 2: Dimensional Reduction Coordinate Alignment
+# ======================================================================
+# Execute Monocle3 default UMAP reduction with optimized configurations
+cds <- reduce_dimension(
+  cds, 
+  reduction_method = "UMAP", 
+  cores            = 16, 
+  umap.fast_sgd    = TRUE
+)
+
+# Overwrite Monocle3 embedding slot with standard Seurat UMAP coordinates
+# This ensures geometric flow consistency and cluster positioning alignment
+cds_cells <- rownames(cds@int_colData$reducedDims$UMAP)
+seurat_embeddings <- Embeddings(seu, reduction = "umap")[cds_cells, ]
+cds@int_colData$reducedDims$UMAP <- seurat_embeddings
+
+
+# ======================================================================
+# MODULE 3: Graph Learning & Trajectory Inference
+# ======================================================================
+# Partitions and clusters cells using the Louvain community detection algorithm
+cds <- cluster_cells(cds, cluster_method = "louvain")
+
+# Learn the principal differentiation graph across the manifold space
+cds <- learn_graph(cds)
+
+# Map continuous pseudotime scoring trajectories across the graph structure
+cds <- order_cells(cds)
+
+# Generate publication-grade trajectory visualization map
+p_trajectory <- plot_cells(
+  cds, 
+  color_cells_by          = "pseudotime", 
+  label_cell_groups       = FALSE,  
+  label_leaves            = FALSE,  
+  label_branch_points     = FALSE
+) + scale_color_distiller(palette = 'RdYlBu')
+
+ggsave(filename = output_trajectory_pdf, plot = p_trajectory, width = 7, height = 6)
+
+
+# ======================================================================
+# MODULE 4: Spatial Autocorrelation Testing (Moran's I Analysis)
+# ======================================================================
+# Execute non-parametric testing against the principal graph structure
+track_genes <- graph_test(cds, neighbor_graph = "principal_graph", cores = 6)
+
+# Reorder columns and apply false-discovery rate (FDR) filtering thresholds
+track_genes_filtered <- track_genes %>%
+  select(status, p_value, q_value, morans_test_statistic, morans_I, gene_short_name) %>%
+  filter(q_value < 1e-3)
+
+write.csv(track_genes_filtered, file = output_genes_csv, row.names = FALSE)
+
+
+# ======================================================================
+# MODULE 5: Pseudo-Temporal Kinetic Visualizations
+# ======================================================================
+# Extract the top N trajectory-associated features ranked by Moran's I coefficients
+top_sig_genes <- track_genes_filtered %>% 
+  top_n(n = num_top_genes, wt = morans_I) %>%  
+  pull(gene_short_name) %>% 
+  as.character()
+
+# Visualize expression kinetics for top dynamic trajectory markers
+p_top_kinetic <- plot_genes_in_pseudotime(
+  cds[top_sig_genes, ], 
+  color_cells_by = "celltype_fine",                               
+  min_expr       = 0.5, 
+  ncol           = 2
+)
+
+# Visualize custom pathway regulators, checkpoint molecules, and score signatures
+p_curated_kinetic <- plot_genes_in_pseudotime(
+  cds[target_features_vector, ], 
+  color_cells_by = "celltype_fine",                               
+  min_expr       = 0.5, 
+  ncol           = 2
+)
+
+ggsave(filename = output_kinetic_pdf, plot = p_curated_kinetic, width = 8, height = 6)
+
+
+# ======================================================================
+# MODULE 6: Memory Cleanup
+# ======================================================================
+rm(raw_counts, cell_metadata, gene_annotation, seurat_embeddings, track_genes)
+gc()
